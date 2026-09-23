@@ -349,3 +349,34 @@ test('OAuth never follows a redirect to another host', async () => {
   await assert.rejects(() => session.submitOtp('test', '123456'), /AUTH_REDIRECT_INVALID/);
   assert.equal(calls, 1);
 });
+
+test('session renewal restores expired SDK client context and persists rotated cookies', async () => {
+  let cookies = [];
+  let saved;
+  const session = new PortalSession(
+    {
+      addCookies: async (values) => {
+        cookies = values;
+      },
+      cookies: async () => [...cookies, { name: 'synthetic-refresh', value: 'rotated' }],
+      request: {
+        post: async (url) => {
+          assert.equal(url, 'https://accounts.zomato.com/token/refresh');
+          assert.equal(cookies.find((c) => c.name === 'purl').value, 'https://www.zomato.com');
+          assert.ok(cookies.find((c) => c.name === 'cid').expires > Date.now() / 1000 + 30000000);
+          return { status: () => 200, ok: () => true, json: async () => ({ status: true }) };
+        },
+      },
+    },
+    {},
+    {
+      write: async (_name, value) => {
+        saved = value;
+      },
+    },
+  );
+  session.headers = { stale: 'csrf' };
+  await session.refresh();
+  assert.equal(session.headers, null);
+  assert.equal(saved.at(-1).value, 'rotated');
+});

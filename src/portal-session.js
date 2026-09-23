@@ -69,8 +69,21 @@ export class PortalSession {
   async save() {
     await this.store.write('session-cookies', await this.context.cookies());
   }
+  async setClientContext() {
+    // The SDK keeps its public client ID for a year. The account iframe also
+    // supplies its parent origin; renewal needs this after short-lived cookies expire.
+    const expires = Math.floor(Date.now() / 1000);
+    await this.context.addCookies(
+      [
+        { name: 'cid', value: CLIENT, domain: '.zomato.com', expires: expires + 31536000 },
+        { name: 'purl', value: SITE, domain: 'accounts.zomato.com', expires: expires + 900 },
+        { name: 'callback', value: '', domain: 'accounts.zomato.com', expires: expires + 900 },
+      ].map((cookie) => ({ ...cookie, path: '/', secure: true, sameSite: 'None' })),
+    );
+  }
   async prepare() {
     if (this.headers) return;
+    await this.setClientContext();
     const csrfResponse = await this.context.request.get(`${SITE}/webroutes/auth/csrf`, {
       timeout: 20000,
       maxRedirects: 0,
@@ -124,6 +137,7 @@ export class PortalSession {
     return value;
   }
   async refresh() {
+    await this.setClientContext();
     const response = await this.context.request.post(`${ACCOUNTS}/token/refresh`, {
       multipart: { cid: CLIENT, callback: '' },
       headers: loginHeaders,
@@ -150,17 +164,7 @@ export class PortalSession {
     }))
       url.searchParams.set(key, value);
     const expires = Math.floor(Date.now() / 1000) + 900;
-    await this.context.addCookies([
-      {
-        name: 'cid',
-        value: CLIENT,
-        domain: '.zomato.com',
-        path: '/',
-        secure: true,
-        sameSite: 'None',
-        expires,
-      },
-    ]);
+    await this.setClientContext();
     const response = await followAccount(this.context.request, url.href, true);
     const landing = new URL(response.url());
     const loginChallenge = landing.searchParams.get('login_challenge');
