@@ -213,7 +213,7 @@ app.post('/mcp', async (req, res) => {
 app.all('/mcp', (_req, res) => res.sendStatus(405));
 app.use((_error, _req, res, _next) => res.status(400).json({ error: 'INVALID_REQUEST' }));
 await browser.start();
-app.listen(config.port, '127.0.0.1', () =>
+const listener = app.listen(config.port, '127.0.0.1', () =>
   console.log(JSON.stringify({ event: 'service_started', port: config.port })),
 );
 const timer = setInterval(() => {
@@ -224,3 +224,14 @@ const timer = setInterval(() => {
     void browser.queue.run(() => browser.check()).catch(() => {});
 }, 15 * 60000);
 timer.unref();
+let shuttingDown = false;
+const shutdown = async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearInterval(timer);
+  listener.close();
+  await browser.context.close().catch(() => {});
+  process.exit(0);
+};
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
