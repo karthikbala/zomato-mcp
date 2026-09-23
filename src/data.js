@@ -95,24 +95,41 @@ export function normalizeOrderDetail(raw, expectedId, expectedRestaurantId) {
     source: 'zomato_order_detail',
   };
 }
-export function parseSalesTable(rows) {
-  if (!Array.isArray(rows) || rows.length < 3) throw new ServiceError('REPORT_SCHEMA_CHANGED');
-  const header = rows[0];
-  if (header[0] !== 'Metric') throw new ServiceError('REPORT_SCHEMA_CHANGED');
-  const periods = header.slice(2, -1).map((label) => ({ label, metrics: {} }));
-  if (!periods.length) throw new ServiceError('REPORT_SCHEMA_CHANGED');
-  for (const cells of rows.slice(1)) {
-    if (cells.length === 1) continue;
-    if (cells.length < periods.length + 2) continue;
-    const metric = cells[0];
-    if (!metric) continue;
-    for (let i = 0; i < periods.length; i++) periods[i].metrics[metric] = cells[i + 2] ?? null;
-  }
-  if (!periods.some((period) => period.metrics.Sales && period.metrics['Delivered orders']))
+export function parseBusinessReport(payload, restaurantId) {
+  const selected = payload?.meta?.selected_res_ids;
+  if (
+    !Array.isArray(selected) ||
+    selected.length !== 1 ||
+    String(selected[0]) !== restaurantId ||
+    String(payload.filters?.selected_filters?.outlet) !== restaurantId
+  )
+    throw new ServiceError('OUTLET_MISMATCH');
+  const headers = payload.data?.column_headers;
+  const sections = payload.data?.sections;
+  if (!Array.isArray(headers) || !Array.isArray(sections))
+    throw new ServiceError('REPORT_SCHEMA_CHANGED');
+  const columns = headers.filter((h) => !['metric', 'trend', 'growth'].includes(h.accessor));
+  if (!columns.length || columns.some((h) => typeof h.accessor !== 'string' || !h.header?.value))
+    throw new ServiceError('REPORT_SCHEMA_CHANGED');
+  const rows = sections.flatMap((section) => section.row_data || []);
+  const periods = columns.map((column) => ({
+    label: [column.header.value, column.subheader?.value].filter(Boolean).join(' '),
+    metrics: Object.fromEntries(
+      rows
+        .filter((row) => typeof row.metric?.value === 'string')
+        .map((row) => [row.metric.value, row[column.accessor]?.value ?? null]),
+    ),
+  }));
+  if (
+    periods.some(
+      (period) => period.metrics.Sales == null || period.metrics['Delivered orders'] == null,
+    )
+  )
     throw new ServiceError('REPORT_SCHEMA_CHANGED');
   return {
     periods,
-    source: 'zomato_business_reports_visible_weekly_table',
     periodBasis: 'displayed_labels',
+    selectedTimeFilter: payload.filters.selected_filters.time ?? null,
+    source: 'zomato_business_report_api',
   };
 }

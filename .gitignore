@@ -6,3 +6,4 @@ data/
 output/
 playwright-report/
 .DS_Store
+runtime/

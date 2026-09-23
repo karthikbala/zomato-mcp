@@ -9,7 +9,8 @@ User=zomato-mcp
 Group=zomato-mcp
 WorkingDirectory=/opt/zomato-mcp
 EnvironmentFile=/etc/zomato-mcp/service.env
-ExecStart=/opt/zomato-mcp/runtime/bin/node src/server.js
+Environment=BROWSER_HEADLESS=false
+ExecStart=/usr/bin/xvfb-run -a /opt/zomato-mcp/runtime/bin/node src/server.js
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -18,6 +19,8 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/zomato-mcp
 UMask=0077
+MemoryMax=2G
+TasksMax=512
 
 [Install]
 WantedBy=multi-user.target

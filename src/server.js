@@ -18,6 +18,7 @@ const config = {
   outletName: process.env.ZOMATO_OUTLET_NAME,
   mcpToken: process.env.MCP_TOKEN,
   ownerKey: process.env.OWNER_KEY,
+  headless: process.env.BROWSER_HEADLESS !== 'false',
 };
 let publicUrl;
 try {
@@ -134,13 +135,15 @@ app.post(
   route((req) => browser.queue.run(() => browser.submitOtp(req.body?.challengeId, req.body?.otp))),
 );
 const mcp = () => {
-  const server = new McpServer({ name: 'zomato-partner-mcp', version: '0.1.0' });
+  const server = new McpServer({ name: 'zomato-partner-mcp', version: '0.1.1' });
   const register = (name, description, inputSchema, fn) =>
     server.registerTool(name, { description, inputSchema }, async (args) => {
       try {
         const value = await browser.queue.run(() => fn(args));
         return toolResult(value, browser.identity());
       } catch (error) {
+        if (['AUTH_REQUIRED', 'ACCOUNT_MISMATCH', 'OUTLET_MISMATCH'].includes(error.code))
+          browser.state = error.code;
         return toolError(error, browser.identity(), `${config.publicOrigin}/owner`);
       }
     });
@@ -174,7 +177,7 @@ const mcp = () => {
   );
   register(
     'get_sales_report',
-    'Read the displayed Zomato business report with its actual period labels. No report settings are changed.',
+    'Read the Zomato business report with its returned outlet scope and actual period labels. No report settings are changed.',
     {},
     () => browser.salesReport(),
   );
@@ -217,6 +220,7 @@ const timer = setInterval(() => {
   for (const [id, session] of sessions) if (session.expiresAt < Date.now()) sessions.delete(id);
   for (const [ip, values] of attempts)
     if (values.every((time) => Date.now() - time > 600000)) attempts.delete(ip);
-  if (!browser.challenge) void browser.queue.run(() => browser.check()).catch(() => {});
+  if (!browser.challenge || browser.challenge.expiresAt <= Date.now())
+    void browser.queue.run(() => browser.check()).catch(() => {});
 }, 15 * 60000);
 timer.unref();

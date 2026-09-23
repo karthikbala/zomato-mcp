@@ -36,6 +36,7 @@ try {
     [
       'PORT=9320',
       'DATA_DIR=./data',
+      'BROWSER_HEADLESS=false',
       `PUBLIC_ORIGIN=${origin}`,
       `ZOMATO_MOBILE=${mobile}`,
       `ZOMATO_RESTAURANT_ID=${restaurantId}`,

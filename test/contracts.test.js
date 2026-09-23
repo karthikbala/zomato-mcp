@@ -1,8 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { dateRange, normalizeHistory, normalizeOrderDetail, parseSalesTable } from '../src/data.js';
+import { createHash } from 'node:crypto';
+import {
+  dateRange,
+  normalizeHistory,
+  normalizeOrderDetail,
+  parseBusinessReport,
+} from '../src/data.js';
 import { readCursor, signedCursor, ServiceError } from '../src/security.js';
 import { ZomatoBrowser } from '../src/browser.js';
+import { PortalSession, accountRedirect } from '../src/portal-session.js';
 import { toolResult, toolError, toolMessageDecorator } from '../src/responses.js';
 
 const snippet = (id) => ({
@@ -98,22 +105,6 @@ test('order detail validates outlet/order binding and rounds upstream float arti
   assert.throws(() => normalizeOrderDetail(source, '12345678', '999999'), /ORDER_SCHEMA_CHANGED/);
 });
 
-test('sales parser uses rendered weekly labels even if URL claims daily dates', () => {
-  const rows = [
-    ['Metric', 'Trend', 'Week 38 14 - 20 Sep 2026', 'Week 39 21 - 22 Sep 2026', 'Change'],
-    ['Sales overview'],
-    ['Sales', 'trend', '₹5,570', '₹3,990', '+133.9%'],
-    ['Delivered orders', 'trend', '19', '14', '+133.3%'],
-    ['Online %', 'trend', '68.6%', '97.5%', '+7.5%'],
-  ];
-  const report = parseSalesTable(rows);
-  assert.equal(report.periodBasis, 'displayed_labels');
-  assert.equal(report.periods[1].label, 'Week 39 21 - 22 Sep 2026');
-  assert.equal(report.periods[1].metrics.Sales, '₹3,990');
-  assert.equal(report.periods[0].metrics['Online %'], '68.6%');
-  assert.throws(() => parseSalesTable([['Metric']]), ServiceError);
-});
-
 test('signed cursors reject tampering and SDK errors carry identity in batches', () => {
   const key = 'a-private-installation-key';
   const cursor = signedCursor({ restaurantId: '87654321', postback: 'opaque' }, key);
@@ -149,21 +140,14 @@ test('pagination signs source continuation and discovers only returned order IDs
   };
   const browser = new ZomatoBrowser({ restaurantId: '87654321', mobile: '0000000000' }, store);
   browser.identityKey = 'key';
-  browser.apiHeaders = { 'x-zomato-csrft': 'private' };
-  browser.historyHeaders = async () => {};
+  browser.requireReady = async () => {};
   const bodies = [];
-  browser.context = {
-    request: {
-      post: async (_url, options) => {
-        bodies.push(options.data);
-        return {
-          status: () => 200,
-          json: async () =>
-            bodies.length === 1
-              ? { hasMore: true, postbackParams: 'next', snippets: [snippet(12345678)] }
-              : { hasMore: false, postbackParams: '', snippets: [snippet(12345679)] },
-        };
-      },
+  browser.portal = {
+    read: async (_url, options) => {
+      bodies.push(options.data);
+      return bodies.length === 1
+        ? { hasMore: true, postbackParams: 'next', snippets: [snippet(12345678)] }
+        : { hasMore: false, postbackParams: '', snippets: [snippet(12345679)] };
     },
   };
   const first = await browser.listOrders({ dateFrom: '2026-09-22', dateTo: '2026-09-23' });
@@ -175,4 +159,193 @@ test('pagination signs source continuation and discovers only returned order IDs
   assert.equal(bodies[1].postback_params, 'next');
   assert.equal(second.pagination.complete, true);
   assert.deepEqual(Object.keys(values['discovered-orders'].ids).sort(), ['12345678', '12345679']);
+});
+
+test('business report binds the outlet and preserves actual periods when requested dates are ignored', () => {
+  const source = {
+    meta: { selected_res_ids: [87654321] },
+    filters: { selected_filters: { outlet: 87654321, time: 'ist_isoweek' } },
+    data: {
+      column_headers: [
+        { accessor: 'metric' },
+        { accessor: 'trend' },
+        {
+          accessor: '2026_39',
+          header: { value: 'Week 39' },
+          subheader: { value: '21 - 22 Sep 2026' },
+        },
+        { accessor: 'growth' },
+      ],
+      sections: [
+        {
+          row_data: [
+            { metric: { value: 'Sales' }, '2026_39': { value: '₹500' } },
+            { metric: { value: 'Delivered orders' }, '2026_39': { value: '2' } },
+          ],
+        },
+      ],
+    },
+  };
+  const report = parseBusinessReport(source, '87654321');
+  assert.equal(report.periods[0].label, 'Week 39 21 - 22 Sep 2026');
+  assert.equal(report.selectedTimeFilter, 'ist_isoweek');
+  assert.equal(report.periods[0].metrics.Sales, '₹500');
+  assert.throws(() => parseBusinessReport(source, '99999999'), /OUTLET_MISMATCH/);
+  source.meta.selected_res_ids.push(99999999);
+  assert.throws(() => parseBusinessReport(source, '87654321'), /OUTLET_MISMATCH/);
+});
+
+test('OAuth rejects external redirects and a callback with the wrong state before exchanging credentials', async () => {
+  for (const value of [
+    'https://attacker.example/zoauth/callback',
+    'http://accounts.zomato.com/zoauth/callback',
+    'https://user@accounts.zomato.com/zoauth/callback',
+    'https://accounts.zomato.com/signout',
+  ])
+    assert.throws(() => accountRedirect(value), /AUTH_REDIRECT_INVALID/);
+  let posted = false;
+  const session = new PortalSession(
+    {
+      request: {
+        get: async () => ({
+          status: () => 200,
+          ok: () => true,
+          url: () => 'https://accounts.zomato.com/zoauth/callback?state=wrong&code=fake',
+        }),
+        post: async () => {
+          posted = true;
+        },
+      },
+    },
+    {},
+    {},
+  );
+  session.challenge = {
+    id: 'test',
+    state: 'expected',
+    redirect: 'https://accounts.zomato.com/oauth2/auth',
+    expiresAt: Date.now() + 10000,
+  };
+  await assert.rejects(() => session.submitOtp('test', '123456'), /AUTH_STATE_MISMATCH/);
+  assert.equal(posted, false);
+});
+
+test('account substitution fails closed even when another account can access the same restaurant', async () => {
+  const browser = new ZomatoBrowser(
+    { mobile: '0000000000', restaurantId: '87654321', outletName: 'Example Cafe' },
+    {
+      read: async () => 'original-account',
+    },
+  );
+  browser.identityKey = 'synthetic-key';
+  browser.portal = { read: async () => ({ loggedIn: true, userId: 'different-account' }) };
+  const status = await browser.check();
+  assert.equal(status.state, 'ACCOUNT_MISMATCH');
+  assert.equal(status.identity.verification, 'unverified');
+});
+
+test('OTP login binds PKCE and state, follows consent, and saves cookies without saving the OTP', async () => {
+  const cookieJar = [];
+  const saved = [];
+  let oauthState;
+  let challengeHash;
+  let verifying = false;
+  let consented = false;
+  const response = (url, body = {}, status = 200, location) => ({
+    url: () => url,
+    ok: () => status === 200,
+    status: () => status,
+    json: async () => body,
+    headers: () => (location ? { location } : {}),
+  });
+  const context = {
+    cookies: async () => cookieJar,
+    addCookies: async (cookies) => cookieJar.push(...cookies),
+    request: {
+      get: async (address) => {
+        const url = new URL(address);
+        if (url.pathname === '/oauth2/auth') {
+          if (!verifying) {
+            oauthState = url.searchParams.get('state');
+            challengeHash = url.searchParams.get('code_challenge');
+            return response(address, {}, 302, '/zoauth/login?login_challenge=synthetic');
+          }
+          return response(
+            address,
+            {},
+            302,
+            consented
+              ? `/zoauth/callback?code=synthetic&state=${oauthState}&scope=offline%20openid`
+              : '/zoauth/consent?consent_challenge=synthetic',
+          );
+        }
+        return response(address);
+      },
+      post: async (address, options) => {
+        const path = new URL(address).pathname;
+        if (path === '/login/phone') {
+          if (options.multipart.type === 'initiate') return response(address, { status: true });
+          assert.equal(options.multipart.otp, '123456');
+          verifying = true;
+          return response(address, {
+            status: true,
+            redirect_to: '/oauth2/auth?login_verifier=synthetic',
+          });
+        }
+        if (path === '/consent') {
+          assert.equal(options.multipart.cc, 'synthetic');
+          consented = true;
+          return response(address, {
+            status: true,
+            redirect_to: '/oauth2/auth?consent_verifier=synthetic',
+          });
+        }
+        assert.equal(path, '/callback');
+        assert.equal(options.multipart.state, oauthState);
+        assert.equal(options.multipart.scope, 'offline openid');
+        return response(address, { status: true });
+      },
+    },
+  };
+  const session = new PortalSession(
+    context,
+    { mobile: '0000000000' },
+    {
+      write: async (_name, value) => saved.push(structuredClone(value)),
+    },
+  );
+  const challenge = await session.startLogin();
+  const verifier = cookieJar.find((cookie) => cookie.name === 'zxcv').value;
+  assert.equal(createHash('sha256').update(verifier).digest('base64url'), challengeHash);
+  await session.submitOtp(challenge.challengeId, '123456');
+  assert.equal(session.challenge, null);
+  assert.equal(saved.length, 1);
+  assert.ok(!JSON.stringify(saved).includes('123456'));
+});
+
+test('OAuth never follows a redirect to another host', async () => {
+  let calls = 0;
+  const session = new PortalSession(
+    {
+      request: {
+        get: async () => {
+          calls++;
+          return {
+            status: () => 302,
+            headers: () => ({ location: 'https://attacker.example/collect' }),
+          };
+        },
+      },
+    },
+    {},
+    {},
+  );
+  session.challenge = {
+    id: 'test',
+    state: 'expected',
+    redirect: 'https://accounts.zomato.com/oauth2/auth',
+    expiresAt: Date.now() + 10000,
+  };
+  await assert.rejects(() => session.submitOtp('test', '123456'), /AUTH_REDIRECT_INVALID/);
+  assert.equal(calls, 1);
 });
