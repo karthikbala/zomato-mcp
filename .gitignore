@@ -1,0 +1,8 @@
+node_modules/
+.env
+.secrets/
+.private/
+data/
+output/
+playwright-report/
+.DS_Store

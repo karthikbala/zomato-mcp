@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Zomato MCP owner</title>
+    <link rel="stylesheet" href="/owner.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Zomato MCP</h1>
+      <p>Check the restaurant session and renew it when needed.</p>
+      <section id="unlock">
+        <label>Owner key <input id="key" type="password" autocomplete="off" /></label
+        ><button id="unlockButton">Unlock</button>
+      </section>
+      <section id="controls" hidden>
+        <pre id="status"></pre>
+        <button id="check">Check session</button><button id="start">Send login OTP</button>
+        <div id="otpBox" hidden>
+          <label>OTP <input id="otp" inputmode="numeric" autocomplete="one-time-code" /></label
+          ><button id="complete">Finish login</button>
+        </div>
+      </section>
+      <p id="message" role="status"></p>
+    </main>
+    <script src="/owner.js" defer></script>
+  </body>
+</html>

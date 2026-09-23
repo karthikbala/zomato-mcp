@@ -1,0 +1,30 @@
+{
+  "name": "zomato-partner-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Single-outlet, read-only Zomato Restaurant Partner MCP",
+  "type": "module",
+  "engines": {
+    "node": ">=22.9.0"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "test": "node --test test/*.test.js",
+    "check": "node scripts/check-syntax.mjs",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "configure": "node scripts/configure.mjs",
+    "check:public": "node scripts/check-public-files.mjs",
+    "test:live": "node --env-file=.env test/live-readonly.mjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "express": "5.2.1",
+    "playwright": "1.63.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "prettier": "3.9.8"
+  }
+}

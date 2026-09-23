@@ -1,0 +1,23 @@
+[Unit]
+Description=Zomato Restaurant Partner MCP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zomato-mcp
+Group=zomato-mcp
+WorkingDirectory=/opt/zomato-mcp
+EnvironmentFile=/etc/zomato-mcp/service.env
+ExecStart=/opt/zomato-mcp/runtime/bin/node src/server.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zomato-mcp
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
