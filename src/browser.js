@@ -2,10 +2,11 @@ import { chromium } from 'playwright';
 import { mkdir } from 'node:fs/promises';
 import { createHmac } from 'node:crypto';
 import { SerialQueue, ServiceError, signedCursor, readCursor, token } from './security.js';
-import { dateRange, normalizeHistory, normalizeOrderDetail, parseSalesTable } from './data.js';
+import { dateRange, normalizeHistory, normalizeOrderDetail, parseBusinessReport } from './data.js';
+
+import { PortalSession } from './portal-session.js';
 
 const ORIGIN = 'https://www.zomato.com';
-const PARTNER = `${ORIGIN}/partners/onlineordering`;
 const HISTORY_PATH = '/merchant-gw/web/order/history/get-all-v2';
 const DETAIL_PATH = '/merchant-api/orders/order-details';
 
@@ -26,13 +27,17 @@ export class ZomatoBrowser {
       await this.store.write('identity-key', this.identityKey);
     }
     this.context = await chromium.launchPersistentContext(`${this.config.dataDir}/profile`, {
-      headless: true,
+      headless: this.config.headless !== false,
+      channel: 'chromium',
       chromiumSandbox: true,
       viewport: { width: 1440, height: 1000 },
       locale: 'en-IN',
       timezoneId: 'Asia/Kolkata',
       acceptDownloads: false,
     });
+    const cookies = await this.store.read('session-cookies', []);
+    if (cookies.length) await this.context.addCookies(cookies);
+    this.portal = new PortalSession(this.context, this.config, this.store);
     this.page = this.context.pages()[0] || (await this.context.newPage());
     this.page.setDefaultTimeout(20000);
     this.page.setDefaultNavigationTimeout(30000);
@@ -52,7 +57,7 @@ export class ZomatoBrowser {
         reference: ref(`outlet:${this.config.mobile}:${this.config.restaurantId}`),
         restaurantId: this.config.restaurantId,
         name: this.config.outletName,
-        source: 'configured_and_checked_against_partner_portal',
+        source: 'configured_and_checked_against_partner_account_api',
       },
       verification: this.state === 'READY' ? 'outlet_verified' : 'unverified',
     };
@@ -70,28 +75,35 @@ export class ZomatoBrowser {
     if (this.challenge && this.challenge.expiresAt > Date.now()) return this.status();
     this.challenge = null;
     try {
-      await this.page.goto(`${PARTNER}/outletInfo/`, { waitUntil: 'domcontentloaded' });
-      await this.page
-        .getByText(/Restaurant ID\s*:/)
-        .first()
-        .waitFor({ timeout: 15000 });
-      const text = await this.page.locator('body').innerText();
-      const id = text.match(/Restaurant ID\s*:\s*(\d{6,15})/i)?.[1];
-      if (id !== this.config.restaurantId || !text.includes(this.config.outletName)) {
-        this.state = 'OUTLET_MISMATCH';
-        return this.status();
+      const accountUrl = `${ORIGIN}/restaurant-onboard-diy/check-auth`;
+      let account;
+      try {
+        account = await this.portal.read(accountUrl);
+        if (account.loggedIn !== true) throw new ServiceError('AUTH_REQUIRED');
+      } catch (error) {
+        if (error.code !== 'AUTH_REQUIRED') throw error;
+        await this.portal.refresh();
+        account = await this.portal.read(accountUrl);
       }
+      if (account.loggedIn !== true || !account.userId) throw new ServiceError('AUTH_REQUIRED');
+      const pinnedAccount = await this.store.read('account-id');
+      if (pinnedAccount && String(pinnedAccount) !== String(account.userId))
+        throw new ServiceError('ACCOUNT_MISMATCH');
+      const data = await this.portal.read(
+        'https://api.zomato.com/merchant-gw/web/restaurant/get-all-minimal-lite',
+      );
+      if (!Array.isArray(data.entities)) throw new ServiceError('OUTLET_SCHEMA_CHANGED');
+      if (data.is_degraded_mode) throw new ServiceError('PORTAL_DEGRADED');
+      const outlet = data.entities.find((item) => String(item.id) === this.config.restaurantId);
+      if (!outlet || outlet.name !== this.config.outletName)
+        throw new ServiceError('OUTLET_MISMATCH');
+      if (!pinnedAccount) await this.store.write('account-id', String(account.userId));
+      this.outlet = outlet;
       this.state = 'READY';
       this.lastVerifiedAt = new Date().toISOString();
     } catch (error) {
-      // Login redirects and transport failures are different states for the owner.
-      this.state =
-        this.page.url().includes('/partners/') &&
-        (await this.page
-          .getByRole('button', { name: /Send OTP|Continue with Email|Login/i })
-          .count())
-          ? 'AUTH_REQUIRED'
-          : 'SITE_UNAVAILABLE';
+      this.outlet = null;
+      this.state = error instanceof ServiceError ? error.code : 'SITE_UNAVAILABLE';
     }
     return this.status();
   }
@@ -100,33 +112,15 @@ export class ZomatoBrowser {
     if (this.state !== 'READY') throw new ServiceError(this.state);
   }
   async startLogin() {
-    await this.page.goto(`${ORIGIN}/partners/`, { waitUntil: 'domcontentloaded' });
-    const phone = this.page.getByPlaceholder(/Phone number/i).first();
-    if (!(await phone.count())) throw new ServiceError('LOGIN_FORM_CHANGED');
-    await phone.fill(this.config.mobile);
-    await this.page.getByRole('button', { name: /Send OTP/i }).click();
-    this.challenge = { id: token(), expiresAt: Date.now() + 600000 };
+    if (this.challenge && this.challenge.expiresAt > Date.now())
+      return { challengeId: this.challenge.id, expiresAt: this.challenge.expiresAt };
+    const result = await this.portal.startLogin();
+    this.challenge = this.portal.challenge;
     this.state = 'OTP_REQUIRED';
-    return { challengeId: this.challenge.id, expiresAt: this.challenge.expiresAt };
+    return result;
   }
   async submitOtp(challengeId, code) {
-    if (
-      !this.challenge ||
-      this.challenge.id !== challengeId ||
-      this.challenge.expiresAt < Date.now()
-    )
-      throw new ServiceError('OTP_CHALLENGE_EXPIRED');
-    if (!/^\d{4,8}$/.test(code)) throw new ServiceError('INVALID_OTP');
-    const fields = this.page.locator(
-      'input[autocomplete="one-time-code"], input[placeholder*="OTP" i], input[maxlength="1"]',
-    );
-    const count = await fields.count();
-    if (count === 1) await fields.first().fill(code);
-    else if (count === code.length) {
-      for (let i = 0; i < count; i++) await fields.nth(i).fill(code[i]);
-    } else throw new ServiceError('LOGIN_FORM_CHANGED');
-    const submit = this.page.getByRole('button', { name: /Verify|Continue|Submit/i }).first();
-    if (await submit.count()) await submit.click();
+    await this.portal.submitOtp(challengeId, code);
     this.challenge = null;
     await this.check();
     if (this.state !== 'READY') throw new ServiceError(this.state);
@@ -134,50 +128,17 @@ export class ZomatoBrowser {
   }
   async availability() {
     await this.requireReady();
-    await this.page.goto(PARTNER, { waitUntil: 'domcontentloaded' });
-    const labels = await this.page.locator('span').allTextContents();
-    const states = labels.map((s) => s.trim()).filter((s) => s === 'Online' || s === 'Offline');
-    if (states.length !== 1) throw new ServiceError('AVAILABILITY_SCHEMA_CHANGED');
+    if (![0, 1].includes(this.outlet.delivery_status))
+      throw new ServiceError('AVAILABILITY_SCHEMA_CHANGED');
     return {
-      status: states[0].toUpperCase(),
+      status: this.outlet.delivery_status === 1 ? 'ONLINE' : 'OFFLINE',
       observedAt: new Date().toISOString(),
-      source: 'zomato_partner_status_badge',
-      note: 'Displayed partner status; this does not independently prove customer checkout availability.',
+      source: 'zomato_partner_restaurant_status',
+      note: 'The same status field used by the partner badge; this does not independently prove customer checkout availability.',
     };
   }
-  async historyHeaders() {
-    await this.requireReady();
-    const responsePromise = this.page
-      .waitForResponse(
-        (response) => {
-          const url = new URL(response.url());
-          return url.origin === 'https://api.zomato.com' && url.pathname === HISTORY_PATH;
-        },
-        { timeout: 30000 },
-      )
-      .catch((error) => error);
-    await this.page.goto(`${PARTNER}/orderHistory/`, { waitUntil: 'domcontentloaded' });
-    const response = await responsePromise;
-    if (response instanceof Error) throw new ServiceError('ORDER_SOURCE_UNAVAILABLE');
-    if (response.status() !== 200) throw new ServiceError('ORDER_SOURCE_UNAVAILABLE');
-    const headers = await response.request().allHeaders();
-    this.apiHeaders = Object.fromEntries(
-      Object.entries(headers).filter(([key]) =>
-        [
-          'content-type',
-          'accept',
-          'origin',
-          'referer',
-          'x-client-id',
-          'x-zomato-app-version',
-          'x-zomato-csrft',
-        ].includes(key),
-      ),
-    );
-    if (!this.apiHeaders['x-zomato-csrft']) throw new ServiceError('ORDER_SOURCE_CHANGED');
-  }
   async listOrders(args = {}) {
-    await this.historyHeaders();
+    await this.requireReady();
     const nowIndia = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'Asia/Kolkata',
       year: 'numeric',
@@ -211,23 +172,10 @@ export class ZomatoBrowser {
       rating: '',
       get_filters: !postback,
     };
-    const response = await this.context.request.post(`https://api.zomato.com${HISTORY_PATH}`, {
-      headers: this.apiHeaders,
+    const data = await this.portal.read(`https://api.zomato.com${HISTORY_PATH}`, {
+      method: 'POST',
       data: body,
-      timeout: 30000,
-      maxRedirects: 0,
     });
-    if (response.status() === 401 || response.status() === 403) {
-      this.state = 'AUTH_REQUIRED';
-      throw new ServiceError('AUTH_REQUIRED');
-    }
-    if (response.status() !== 200) throw new ServiceError('ORDER_SOURCE_UNAVAILABLE');
-    let data;
-    try {
-      data = await response.json();
-    } catch {
-      throw new ServiceError('ORDER_SCHEMA_CHANGED');
-    }
     const result = normalizeHistory(data);
     const discovered = await this.store.read('discovered-orders', {
       restaurantId: this.config.restaurantId,
@@ -276,42 +224,38 @@ export class ZomatoBrowser {
     const discovered = await this.store.read('discovered-orders', { ids: {} });
     if (discovered.restaurantId !== this.config.restaurantId || !discovered.ids[orderId])
       throw new ServiceError('ORDER_NOT_DISCOVERED', 'Find this order through list_orders first.');
-    if (!this.apiHeaders) await this.historyHeaders();
     const url = new URL(DETAIL_PATH, ORIGIN);
     url.searchParams.set('tab_id', orderId);
     url.searchParams.set('view', 'order-history');
-    const response = await this.context.request.get(url.href, {
-      headers: this.apiHeaders,
-      timeout: 30000,
-      maxRedirects: 0,
-    });
-    if ([401, 403].includes(response.status())) {
-      this.state = 'AUTH_REQUIRED';
-      throw new ServiceError('AUTH_REQUIRED');
-    }
-    if (response.status() !== 200) throw new ServiceError('ORDER_SOURCE_UNAVAILABLE');
-    let data;
-    try {
-      data = await response.json();
-    } catch {
-      throw new ServiceError('ORDER_SCHEMA_CHANGED');
-    }
+    const data = await this.portal.read(url.href);
     return normalizeOrderDetail(data, orderId, this.config.restaurantId);
   }
   async salesReport() {
     await this.requireReady();
-    await this.page.goto(`${PARTNER}/reporting/?selected_view=view_business_reports`, {
-      waitUntil: 'domcontentloaded',
-    });
-    const table = this.page.frameLocator('iframe[src*="mx-reporting"]').locator('table').first();
-    await table.waitFor({ timeout: 30000 });
-    if (!(await this.page.getByText(this.config.outletName, { exact: true }).first().isVisible()))
-      throw new ServiceError('OUTLET_MISMATCH');
-    const rows = await table.evaluate((element) =>
-      [...element.querySelectorAll('tr')].map((tr) =>
-        [...tr.querySelectorAll('th,td')].map((cell) => cell.innerText.trim().replace(/\s+/g, ' ')),
-      ),
+    const indiaToday = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+    const end = new Date(Date.parse(`${indiaToday}T00:00:00Z`) - 86400000);
+    const start = new Date(end.valueOf() - 9 * 86400000);
+    const url = new URL(
+      'https://api.zomato.com/merchant-gw/web/owner-hub/reporting/get-business-report',
     );
-    return { ...parseSalesTable(rows), observedAt: new Date().toISOString() };
+    for (const [key, value] of Object.entries({
+      view: 'table',
+      selected_res_id: this.config.restaurantId,
+      time_filter: 'ist_day',
+      page_type: 'owner_hub',
+      start_date: start.toISOString().slice(0, 10),
+      end_date: end.toISOString().slice(0, 10),
+    }))
+      url.searchParams.set(key, value);
+    const data = await this.portal.read(url.href, { method: 'POST', data: { filters: [] } });
+    return {
+      ...parseBusinessReport(data, this.config.restaurantId),
+      observedAt: new Date().toISOString(),
+    };
   }
 }
